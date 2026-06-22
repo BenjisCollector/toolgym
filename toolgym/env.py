@@ -1,13 +1,27 @@
 """A minimal Gymnasium-compatible tool-use environment.
 
-The agent is shown an arithmetic query (a op b) and must decide which *tool*
-to invoke. The point is not the arithmetic itself but learning the *policy of
-tool use*: when to gather information (CALCULATOR / LOOKUP) and when to commit
-(SUBMIT). This is a toy stand-in for "agentic models via tool use".
+The agent is shown a *query* and must decide which **tool** to invoke before it
+commits an answer. The point is not the underlying task (arithmetic / lookup)
+but learning the *policy of tool use*: pick the right tool to gather the answer,
+then SUBMIT. This is a toy stand-in for "agentic models via tool use".
+
+There are three task variants, chosen per episode:
+
+* ``arithmetic`` — a query ``a op b``. The **CALCULATOR** tool returns the
+  correct value; the LOOKUP tool returns garbage for this task.
+* ``lookup`` — a query "what is the value of key ``k``?" backed by a small
+  key/value table. The **LOOKUP** tool returns the correct value; the
+  CALCULATOR tool returns garbage for this task.
+* ``mixed`` — the env samples either of the above uniformly; this is the
+  default and forces the agent to *read the task type from the observation*
+  and choose the matching tool.
+
+So the learnable skill is genuinely "select the correct tool conditioned on the
+task, then submit" — not just "always press the same button".
 
 The env follows the Gymnasium API (reset / step / observation_space /
-action_space). It imports Gymnasium when available; otherwise it falls back to
-a tiny local shim so the environment and the random agent run with numpy alone.
+action_space). It imports Gymnasium when available; otherwise it falls back to a
+tiny local shim so the environment, tests, and baselines run with numpy alone.
 """
 
 from __future__ import annotations
@@ -30,12 +44,9 @@ except Exception:  # pragma: no cover - fallback shim, exercised when gym absent
             self.dtype = dtype
 
         def sample(self):
-            return (self.np_random_uniform() * (self.high - self.low) + self.low).astype(
+            return (np.random.random(self.shape) * (self.high - self.low) + self.low).astype(
                 self.dtype
             )
-
-        def np_random_uniform(self):
-            return np.random.random(self.shape)
 
         def contains(self, x):
             x = np.asarray(x)
@@ -74,69 +85,124 @@ except Exception:  # pragma: no cover - fallback shim, exercised when gym absent
 
 
 # Action ids -----------------------------------------------------------------
-CALCULATOR = 0  # compute the answer (reveals it in the observation)
-LOOKUP = 1      # consult a "memory" tool (reveals it in the observation)
+CALCULATOR = 0  # correct for arithmetic tasks; wrong for lookup tasks
+LOOKUP = 1      # correct for lookup tasks; wrong for arithmetic tasks
 SUBMIT = 2      # commit the currently-known answer
 N_ACTIONS = 3
 
-# Supported binary operators, encoded as ints in the observation.
-_OPS = {0: ("+", lambda a, b: a + b), 1: ("-", lambda a, b: a - b), 2: ("*", lambda a, b: a * b)}
+# Task-type ids (also encoded into the observation).
+TASK_ARITHMETIC = 0
+TASK_LOOKUP = 1
+
+# Supported binary operators for arithmetic tasks, encoded as ints.
+_OPS = {
+    0: ("+", lambda a, b: a + b),
+    1: ("-", lambda a, b: a - b),
+    2: ("*", lambda a, b: a * b),
+}
 
 
 class ToolUseEnv(gym.Env):
-    """Tool-use MDP over single-step arithmetic queries.
+    """Tool-use MDP over single-step queries with task-dependent tools.
 
-    Observation (float32 vector of length 5):
-        [operand_a, operand_b, op_id, answer_known, known_answer]
-      - operand_a, operand_b: the query operands (0..max_operand)
-      - op_id:                which operator (0=+, 1=-, 2=*)
-      - answer_known:         1.0 once a CALCULATOR or LOOKUP tool has been used
-      - known_answer:         the tool's answer, or 0.0 before any tool is used
+    Observation (float32 vector of length 7):
+
+        [task_type, operand_a, operand_b, op_id, lookup_key,
+         answer_known, known_answer]
+
+      - task_type:     0 = arithmetic, 1 = lookup
+      - operand_a/b:   operands for arithmetic tasks (0 for lookup tasks)
+      - op_id:         operator for arithmetic tasks (0=+, 1=-, 2=*)
+      - lookup_key:    key id for lookup tasks (0 for arithmetic tasks)
+      - answer_known:  1.0 once the *correct* tool has produced the answer
+      - known_answer:  the answer currently held, or 0.0 before any tool
 
     Actions (Discrete(3)): CALCULATOR, LOOKUP, SUBMIT.
 
     Reward:
-      - CALCULATOR / LOOKUP: -tool_cost (small penalty; info has a price)
-      - SUBMIT with a correct, tool-derived answer: +1.0, episode ends
-      - SUBMIT without ever using a tool, or with a wrong answer: -1.0, ends
-      - Exceeding max_steps tools without submitting: episode truncates, no bonus
+      - Using the *correct* tool for the task: reveals the true answer,
+        costs ``-tool_cost``.
+      - Using the *wrong* tool: returns a garbage value (answer NOT known),
+        costs ``-tool_cost``.
+      - SUBMIT with the correct, tool-derived answer: ``+1.0``, episode ends.
+      - SUBMIT otherwise (no tool used, wrong tool, wrong value): ``-1.0``, ends.
+      - Reaching ``max_steps`` without submitting: episode truncates, no bonus.
+
+    The optimal policy reads ``task_type`` from the observation, calls the
+    matching tool once, then submits — expected return ``+1.0 - tool_cost``.
+
+    Parameters
+    ----------
+    task : {"mixed", "arithmetic", "lookup"}
+        Which task variant(s) to sample each episode. Default ``"mixed"``.
+    max_operand : int
+        Operands are drawn from ``0..max_operand`` (arithmetic tasks).
+    n_keys : int
+        Size of the lookup table (lookup tasks).
+    tool_cost : float
+        Per-tool-call penalty. Information has a price.
+    max_steps : int
+        Patience: episode truncates after this many steps without SUBMIT.
     """
 
     metadata = {"render_modes": ["human"]}
 
-    def __init__(self, max_operand: int = 20, tool_cost: float = 0.1, max_steps: int = 5):
+    def __init__(
+        self,
+        task: str = "mixed",
+        max_operand: int = 20,
+        n_keys: int = 10,
+        tool_cost: float = 0.1,
+        max_steps: int = 5,
+    ):
         super().__init__()
+        if task not in ("mixed", "arithmetic", "lookup"):
+            raise ValueError(f"unknown task variant: {task!r}")
+        self.task = task
         self.max_operand = int(max_operand)
+        self.n_keys = int(n_keys)
         self.tool_cost = float(tool_cost)
         self.max_steps = int(max_steps)
 
-        high = float(max_operand * max_operand)  # bound large enough for products
+        # A fixed lookup "database": key id -> value. Deterministic so the
+        # LOOKUP tool is a genuine information source, not a re-roll each call.
+        self._table = {k: int((k * 7 + 3) % 50) for k in range(self.n_keys)}
+
+        high = float(max(max_operand * max_operand, 50))  # bound for products/values
         self.observation_space = spaces.Box(
-            low=-high, high=high, shape=(5,), dtype=np.float32
+            low=-high, high=high, shape=(7,), dtype=np.float32
         )
         self.action_space = spaces.Discrete(N_ACTIONS)
 
         self._rng = np.random.default_rng()
-        self._a = 0
-        self._b = 0
-        self._op_id = 0
-        self._true_answer = 0
-        self._known_answer = 0.0
-        self._answer_known = False
-        self._steps = 0
+        self._reset_episode_state()
 
     # -- Gymnasium API -------------------------------------------------------
     def reset(self, *, seed=None, options=None):
         if seed is not None:
             self._rng = np.random.default_rng(seed)
-        self._a = int(self._rng.integers(0, self.max_operand + 1))
-        self._b = int(self._rng.integers(0, self.max_operand + 1))
-        self._op_id = int(self._rng.integers(0, len(_OPS)))
-        _, fn = _OPS[self._op_id]
-        self._true_answer = int(fn(self._a, self._b))
-        self._known_answer = 0.0
-        self._answer_known = False
-        self._steps = 0
+
+        if self.task == "mixed":
+            self._task_type = int(self._rng.integers(0, 2))
+        elif self.task == "arithmetic":
+            self._task_type = TASK_ARITHMETIC
+        else:
+            self._task_type = TASK_LOOKUP
+
+        self._reset_episode_state()
+
+        if self._task_type == TASK_ARITHMETIC:
+            self._a = int(self._rng.integers(0, self.max_operand + 1))
+            self._b = int(self._rng.integers(0, self.max_operand + 1))
+            self._op_id = int(self._rng.integers(0, len(_OPS)))
+            _, fn = _OPS[self._op_id]
+            self._true_answer = int(fn(self._a, self._b))
+            self._correct_tool = CALCULATOR
+        else:
+            self._key = int(self._rng.integers(0, self.n_keys))
+            self._true_answer = int(self._table[self._key])
+            self._correct_tool = LOOKUP
+
         return self._obs(), self._info()
 
     def step(self, action):
@@ -150,17 +216,22 @@ class ToolUseEnv(gym.Env):
         reward = 0.0
 
         if action in (CALCULATOR, LOOKUP):
-            # Both tools return the correct answer here; a richer env could make
-            # them noisy / differ in cost. Using a tool reveals the answer.
-            self._known_answer = float(self._true_answer)
-            self._answer_known = True
             reward = -self.tool_cost
+            if action == self._correct_tool:
+                # The matching tool reveals the genuine answer.
+                self._known_answer = float(self._true_answer)
+                self._answer_known = True
+            else:
+                # Wrong tool for this task: returns a deterministic but useless
+                # value, and crucially does NOT mark the answer as known.
+                self._known_answer = float((self._true_answer + 13) % 50)
+                self._answer_known = False
         elif action == SUBMIT:
             terminated = True
             if self._answer_known and int(self._known_answer) == self._true_answer:
                 reward = 1.0
             else:
-                # Guessing without using a tool, or submitting a wrong value.
+                # Guessing with no tool, the wrong tool, or a wrong value.
                 reward = -1.0
 
         if not terminated and self._steps >= self.max_steps:
@@ -169,17 +240,39 @@ class ToolUseEnv(gym.Env):
         return self._obs(), reward, terminated, truncated, self._info()
 
     def render(self):
-        op = _OPS[self._op_id][0]
         known = int(self._known_answer) if self._answer_known else "?"
-        print(f"query: {self._a} {op} {self._b} = ?  | tool answer so far: {known}")
+        if self._task_type == TASK_ARITHMETIC:
+            op = _OPS[self._op_id][0]
+            query = f"{self._a} {op} {self._b} = ?"
+        else:
+            query = f"lookup(key={self._key}) = ?"
+        print(f"task={self._task_name()} | query: {query} | tool answer so far: {known}")
 
     # -- helpers -------------------------------------------------------------
+    def _reset_episode_state(self):
+        self._a = 0
+        self._b = 0
+        self._op_id = 0
+        self._key = 0
+        self._true_answer = 0
+        self._correct_tool = CALCULATOR
+        self._known_answer = 0.0
+        self._answer_known = False
+        self._steps = 0
+        if not hasattr(self, "_task_type"):
+            self._task_type = TASK_ARITHMETIC
+
+    def _task_name(self):
+        return "arithmetic" if self._task_type == TASK_ARITHMETIC else "lookup"
+
     def _obs(self):
         return np.array(
             [
+                float(self._task_type),
                 float(self._a),
                 float(self._b),
                 float(self._op_id),
+                float(self._key),
                 1.0 if self._answer_known else 0.0,
                 float(self._known_answer),
             ],
@@ -188,7 +281,9 @@ class ToolUseEnv(gym.Env):
 
     def _info(self):
         return {
+            "task_type": self._task_name(),
             "true_answer": self._true_answer,
+            "correct_tool": self._correct_tool,
             "answer_known": self._answer_known,
             "steps": self._steps,
         }
